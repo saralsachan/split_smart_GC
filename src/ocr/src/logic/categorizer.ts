@@ -1,0 +1,130 @@
+/**
+ * Auto-categorisation (PS point 13).
+ *  1. Show instant keyword suggestions while the model loads.
+ *  2. Classify every item with the lazy zero-shot model and replace suggestions.
+ * If the model is unavailable, keep the keyword suggestion or Other.
+ */
+import type { Category } from '../types/receipt';
+
+const KEYWORDS: [Category, RegExp][] = [
+  [
+    'Utilities',
+    /\b(wi-?fi|internet|broadband|recharge|electricity|water\s*bill|cylinder|dth|postpaid|prepaid|subscription)\b/i,
+  ],
+  [
+    'Travel',
+    /\b(cab|taxi|uber|ola|rapido|auto|bus|train|metro|flight|fuel|petrol|diesel|toll|parking|fare|ride)\b/i,
+  ],
+  [
+    'Entertainment',
+    /\b(movie|cinema|netflix|spotify|game|gaming|bowling|concert|club|arcade|karaoke|pub)\b/i,
+  ],
+  [
+    'Food',
+    /\b(pizza|burger|maggi|coffee|tea|chai|roll|rolls?|franky|frankie|biryani|thali|paneer|pnr|dosa|idli|samosa|sandwich|fries|juice|shake|cola|coke|pepsi|sprite|fanta|pasta|momos?|noodles?|curry|naan|roti|paratha|kulcha|bhature|chole|pav|bhaji|misal|bhurji|poha|upma|vada|kachori|chaat|masala|tikka|sezwan|schezwan|rice|pulao|khichdi|ice\s*cream|cake|brownie|cookie|mocktail|lassi|soup|salad|wrap|nuggets|chicken|chi\b|mutton|fish|veg|manchurian|fried|combo|meal|snack|chips|chocolate|beer|wine|whisky|vodka|soda|lime|gravy|sabzi)\b/i,
+  ],
+  [
+    'Groceries',
+    /\b(milk|bread|eggs?|atta|flour|raw\s*rice|dal|oil|sugar|salt|soap|shampoo|detergent|vegetables?|fruits?|onion|potato|tomato|butter|cheese|curd|toothpaste|tissue|sanitizer|biscuits?|packet)\b/i,
+  ],
+];
+
+export function keywordCategory(name: string): Category | null {
+  for (const [cat, re] of KEYWORDS) if (re.test(name)) return cat;
+  return null;
+}
+
+export type CategorizerStatus = 'loading-model' | 'downloading' | 'ready' | 'failed';
+export interface CategorizeOptions {
+  /** May be called twice for an item: initial keyword suggestion, then model result. */
+  onResult: (id: string, category: Category, source: 'keyword' | 'model') => void;
+  onStatus?: (s: CategorizerStatus, progress?: number) => void;
+  useModel?: boolean;
+  minScore?: number;
+}
+
+let worker: Worker | null = null;
+let seq = 0;
+const waiting = new Map<
+  number,
+  { resolve: (r: { category: Category; score: number }[]) => void; reject: (e: Error) => void }
+>();
+let statusCb: CategorizeOptions['onStatus'];
+
+function getWorker(): Worker {
+  if (!worker) {
+    worker = new Worker(new URL('../workers/categorizer.worker.ts', import.meta.url), {
+      type: 'module',
+    });
+    worker.onmessage = (e: MessageEvent) => {
+      const m = e.data;
+      if (m.type === 'status')
+        statusCb?.(m.status === 'loading' ? 'loading-model' : m.status, m.progress);
+      else if (m.type === 'result') {
+        waiting.get(m.id)?.resolve(m.results);
+        waiting.delete(m.id);
+      } else if (m.type === 'error') {
+        waiting.get(m.id)?.reject(new Error(m.message));
+        waiting.delete(m.id);
+      }
+    };
+    worker.onerror = () => {
+      waiting.forEach((w) => w.reject(new Error('categorizer worker crashed')));
+      waiting.clear();
+      worker?.terminate();
+      worker = null; // next call can retry
+    };
+  }
+  return worker;
+}
+
+/** Only pass items the user has NOT already categorised/overridden. */
+export async function categorizeItems(
+  items: { id: string; name: string }[],
+  opts: CategorizeOptions
+): Promise<void> {
+  for (const it of items) {
+    const k = keywordCategory(it.name);
+    if (k) opts.onResult(it.id, k, 'keyword');
+  }
+  if (!items.length) {
+    opts.onStatus?.('ready');
+    return;
+  }
+  if (opts.useModel === false) {
+    items
+      .filter((item) => !keywordCategory(item.name))
+      .forEach((item) => opts.onResult(item.id, 'Other', 'keyword'));
+    opts.onStatus?.('ready');
+    return;
+  }
+
+  statusCb = opts.onStatus;
+  try {
+    const id = ++seq;
+    const results = await new Promise<{ category: Category; score: number }[]>(
+      (resolve, reject) => {
+        waiting.set(id, { resolve, reject });
+        getWorker().postMessage({ id, texts: items.map((item) => item.name) });
+      }
+    );
+    results.forEach((r, i) =>
+      opts.onResult(items[i].id, r.score >= (opts.minScore ?? 0.35) ? r.category : 'Other', 'model')
+    );
+    opts.onStatus?.('ready');
+  } catch {
+    opts.onStatus?.('failed');
+    items
+      .filter((item) => !keywordCategory(item.name))
+      .forEach((item) => opts.onResult(item.id, 'Other', 'keyword'));
+  }
+}
+
+/** Optional: call on idle after the review screen mounts to pre-download the model. */
+export function warmUpCategorizer(): void {
+  try {
+    getWorker().postMessage({ id: ++seq, texts: ['pizza'] });
+  } catch {
+    /* ignore */
+  }
+}
